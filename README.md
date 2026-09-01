@@ -1,27 +1,53 @@
 # Migration Learning
 
-A repository for learning and exploring migration concepts and best practices.
 
-## Getting Started
+# Tier 1 — Foundations (single-cloud, scripted migrations)
 
-This project contains resources and examples related to migration workflows and patterns.
+1. **Lift-and-shift a VM fleet with Terraform + Packer**
+Take a set of on-prem-style VMs (simulate with local VirtualBox/VMware or just spin up "legacy" EC2 instances), build golden images with Packer, and write Terraform to provision the target infrastructure (VPC, subnets, security groups, instances). Add a migration runbook script that automates cutover (DNS switch, data sync via rsync/robocopy).
 
-## Contents
+Skills: IaC, image management, network design, cutover orchestration
 
-- Documentation and guides
-- Example code and implementations
-- Learning materials
+2. **Database migration pipeline (RDS/Cloud SQL)**
+Automate migrating a MySQL/PostgreSQL database using AWS DMS or GCP Database Migration Service, driven entirely by Terraform/CLI scripts — not the console. Include schema conversion, continuous replication, and a scripted cutover with rollback capability.
 
-## How to Use
+Skills: CDC (change data capture), schema conversion, minimal-downtime cutover
 
-1. Clone the repository
-2. Explore the contents
-3. Follow along with the examples and documentation
 
-## License
+3. **Storage migration with validation**
+Write a script (Python + boto3, or AWS DataSync/Azure AzCopy) to migrate large file sets (say, simulate a few hundred GB) between storage tiers or providers, with checksum validation, retry logic, and a migration report generator.
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Skills: data integrity verification, idempotent transfer logic, error handling
 
-## Contributing
+# Tier 2 — Intermediate (multi-service, CI/CD-driven)
 
-Contributions are welcome! Feel free to submit issues and pull requests.
+4. **Application containerization + migration pipeline**
+Take a monolithic app (or a sample Node/Java app), containerize it, and build a CI/CD pipeline (GitHub Actions/GitLab CI) that migrates it from VM-based hosting to ECS/EKS/GKE — fully automated build → test → deploy → traffic shift (blue/green or canary).
+
+Skills: containerization, orchestration, progressive delivery
+
+
+5. **Cross-cloud migration tool
+Build a CLI tool (Python) that migrates resources between two providers**
+
+— e.g., an S3-to-GCS bucket migrator, or an EC2-to-Azure VM converter using tools like CloudEndure alternatives or your own scripted image conversion.
+
+Skills: multi-cloud APIs, abstraction design, cost/compatibility mapping
+
+
+6.**Migration factory framework
+This is the "portfolio centerpiece":**
+
+ build a reusable framework (Terraform modules + Python orchestrator) that takes a config file describing a workload (VM count, DB type, storage size) and generates the full migration plan + executes it. Simulate migrating 10-20 "applications" in batch, tracked via a dashboard (even a simple one).
+
+Skills: what real enterprises call a "Migration Factory" — this is literally how AWS/Azure MAP and Google's migration programs operate at scale
+
+
+# Tier 3 — Advanced / production-realistic
+7. **Disaster-recovery-grade migration with rollback**
+Add real rigor to project 6: automated pre-migration validation (dependency checks, connectivity tests), a rollback mechanism if health checks fail post-cutover, and monitoring/alerting hooks (CloudWatch/Datadog) triggered automatically during cutover windows.
+
+8. **Compliance-aware migration
+Add policy-as-code (OPA/Sentinel) that validates target infrastructure meets compliance rules (encryption at rest, tagging standards, network isolation) before migration completes — auto-blocking non-compliant cutovers.**
+
+
