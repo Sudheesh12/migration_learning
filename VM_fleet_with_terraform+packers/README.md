@@ -1,60 +1,95 @@
-## Project 1: Lift-and-Shift a VM Fleet with Terraform + Packer
+## Part 1 — Set up the AWS "host" instance
 
-### Concept
-You'll simulate a real migration engagement: a company has "on-prem" servers (your local Hyper-V/VMware VMs) that need to move to AWS. You'll build golden images, provision the target cloud environment as code, migrate data, and do a scripted cutover — the same workflow used in real Migration Factory engagements.
+1. **Launch the instance**
+   - AMI: Windows Server 2022 (needed for Hyper-V role)
+   - Instance type: `m8i.xlarge` (4 vCPU/16GB) or `c8i.xlarge` — must be one of the nested-virtualization-supported types (C8i, M8i, R8i, C8id, R8id, M8id, C8i-flex, R8i-flex, M8i-flex, X8i, C7i, R7i, M7i, C7id, R7id, M7id, C7i-flex, R7i-flex, M7i-flex, I7i)
+   - In **Advanced details**, set **Nested virtualization → Enable**
+   - Storage: bump to at least 150GB (you'll need room for 2-3 nested VM disks)
 
-### Architecture
+2. **Connect via RDP** and confirm nested virtualization is on:
+   ```powershell
+   Get-VM  # should run without error once Hyper-V is installed (next step)
+   ```
 
+3. **Install the Hyper-V role**
+   ```powershell
+   Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -Restart
+   ```
+   Instance reboots automatically.
+
+4. **Create a virtual switch** (so nested VMs get network access)
+   ```powershell
+   New-VMSwitch -Name "OnPremSwitch" -NetAdapterName "Ethernet" -AllowManagementOS $true
+   ```
+
+### Budget note
+This instance type is not free-tier eligible and Windows licensing adds cost on top of compute. Estimate roughly $0.25–0.40/hr depending on region — so **stop the instance** (not just RDP disconnect) whenever you're not actively working. Don't leave it running overnight. Set an AWS Budget alert at $30–40 given your $200 total.
+
+## Part 2 — Build the on-prem VMs inside Hyper-V
+
+You'll create 2 VMs: an **app server** and a **DB server**, both Ubuntu Server (lighter than Windows guests, easier to script later).
+
+1. **Download Ubuntu Server ISO** to the Windows instance (e.g., Ubuntu Server 24.04 LTS) — use a browser inside the RDP session.
+
+2. **Create the App Server VM**
+   ```powershell
+   New-VM -Name "AppServer" -MemoryStartupBytes 4GB -Generation 2 -NewVHDPath "C:\VMs\AppServer.vhdx" -NewVHDSizeBytes 40GB -SwitchName "OnPremSwitch"
+   Set-VMProcessor -VMName "AppServer" -Count 2
+   Set-VMDvdDrive -VMName "AppServer" -Path "C:\ISOs\ubuntu-24.04-server.iso"
+   Set-VMFirmware -VMName "AppServer" -EnableSecureBoot Off  # needed for Linux Gen2 VMs
+   Start-VM -Name "AppServer"
+   ```
+   Connect via `vmconnect` in Hyper-V Manager and run through the Ubuntu installer normally.
+
+3. **Create the DB Server VM** — repeat with `-Name "DBServer"`, similar specs.
+
+4. **Install the app stack on AppServer** (once Ubuntu is installed):
+   ```bash
+   sudo apt update && sudo apt install -y apache2 php libapache2-mod-php php-mysql
+   sudo systemctl enable apache2 --now
+   ```
+   Drop a simple PHP page in `/var/www/html/index.php` so you have something visibly "running" to migrate later.
+
+5. **Install the DB stack on DBServer**:
+   ```bash
+   sudo apt update && sudo apt install -y mysql-server
+   sudo mysql_secure_installation
+   sudo mysql -e "CREATE DATABASE appdb; CREATE USER 'appuser'@'%' IDENTIFIED BY 'ChangeMe123!'; GRANT ALL ON appdb.* TO 'appuser'@'%'; FLUSH PRIVILEGES;"
+   ```
+   Load some sample data — even a simple `products` or `users` table with a few hundred rows via a `.sql` seed script — so your later migration has something real to verify (row counts, checksums).
+
+6. **Connect the two**: point AppServer's PHP config at DBServer's internal IP, confirm the app can actually query the DB. This "working app" is your migration source of truth — post-cutover, you'll re-test the same functionality against AWS.
+
+7. **Document the environment** (this is the discovery phase real migration engineers do first): OS versions, package versions, open ports (`sudo ss -tulpn`), resource usage baseline. Write it into a `discovery.md` — you'll reference it when sizing the AWS targets.
+
+## Part 3 — Packer, briefly (for when you're ready)
+
+Packer's job: take a base image and bake your app/DB configuration into it, producing a versioned AMI — so instead of manually installing Apache/MySQL on AWS, your target EC2 instances boot up already configured, identical to what you built by hand above.
+
+Minimal shape of a Packer template (`app-server.pkr.hcl`):
+```hcl
+source "amazon-ebs" "app" {
+  ami_name      = "app-server-{{timestamp}}"
+  instance_type = "t3.micro"
+  region        = "us-east-1"
+  source_ami_filter {
+    filters = { name = "ubuntu/images/*24.04*" }
+    owners  = ["099720109477"]
+    most_recent = true
+  }
+  ssh_username = "ubuntu"
+}
+
+build {
+  sources = ["source.amazon-ebs.app"]
+  provisioner "shell" {
+    inline = [
+      "sudo apt update",
+      "sudo apt install -y apache2 php libapache2-mod-php php-mysql"
+    ]
+  }
+}
 ```
-[ON-PREM SIMULATION]              [AWS TARGET]
-Hyper-V/VMware Host                VPC (10.0.0.0/16)
-├── App Server (large VM)    →     ├── Public Subnet (ALB)
-├── DB Server (large VM)     →     ├── Private Subnet (EC2 app tier)
-└── File Server (large VM)   →     └── Private Subnet (RDS/EC2 DB)
-                                    + Security Groups, NAT Gateway
-```
+Run with `packer init .` then `packer build app-server.pkr.hcl`. That's genuinely most of what you need to get a first image built — we'll go deeper (variables, Ansible provisioners, versioning) once your on-prem source is live and you're ready to bake it.
 
-### Phase 1 — Build the "on-prem" environment
-- Set up 2–3 VMs in Hyper-V or VMware Workstation (since you specified large VMs — go with something like 4 vCPU/8GB RAM per VM if your host can handle it; keep an eye on host resource limits, 3 large VMs concurrently can be heavy).
-- Install a real workload on them: e.g., a LAMP/LEMP stack app server, a MySQL/PostgreSQL DB server, and a file server with sample data (a few GB).
-- Document the "current state" like a real assessment: OS version, installed packages, open ports, dependencies. This mirrors the discovery phase real migration engineers do first.
-
-### Phase 2 — Build golden images with Packer
-- Write a Packer template that takes a base AMI (Amazon Linux 2023 or Ubuntu) and provisions it to match your on-prem app server config (install same packages, configure same services) using shell provisioners or Ansible.
-- Output: a versioned AMI you can reference in Terraform. This simulates "re-platforming" the image for cloud rather than raw copy.
-
-### Phase 3 — Provision target infrastructure with Terraform
-Build modules for:
-- VPC with public + private subnets across 2 AZs
-- Security groups mirroring on-prem firewall rules
-- EC2 instances (app tier) from your Packer AMI, in an Auto Scaling Group
-- RDS instance for the DB tier (or EC2 with MySQL if you want more control practice)
-- NAT Gateway, Internet Gateway, route tables
-- S3 bucket for the file server data
-
-Keep this in a clean module structure (`modules/vpc`, `modules/compute`, `modules/database`) — this is what makes it portfolio-worthy versus a single flat `main.tf`.
-
-### Phase 4 — Data migration
-- DB: use `mysqldump`/`pg_dump` for an initial load, then a script to replay recent transactions for near-zero downtime (or just document a maintenance-window approach for v1 — simpler and fine for a portfolio piece).
-- Files: `aws s3 sync` or `rclone` from your local file server to S3, with checksum validation after transfer.
-
-### Phase 5 — Cutover automation
-Write a runbook script (Python or Bash) that:
-1. Runs pre-cutover health checks against the new AWS environment
-2. Performs final data sync (delta only)
-3. Updates DNS (use Route 53 — even a free `.xyz` domain works, or just simulate with a hosts-file style script)
-4. Runs post-cutover validation (hits health endpoints, checks DB connectivity)
-5. Has a documented rollback step if validation fails
-
-### Budget guardrails (important with $200 credit)
-- RDS + EC2 + NAT Gateway running 24/7 will burn credit fast — NAT Gateway alone is ~$32/month plus data processing. **Stop/destroy resources when not actively working** (`terraform destroy` between sessions).
-- Stick to free-tier-eligible instance types (t2.micro/t3.micro) for the AWS side even though your on-prem VMs are large — the point is to prove the pipeline works, not to run production-scale AWS compute.
-- Use AWS Budgets to set a $20–30 alert so you don't get surprised.
-
-### Deliverables for your portfolio
-- GitHub repo with Terraform modules + Packer templates
-- Architecture diagram (before/after)
-- A written runbook (README) documenting the migration process
-- A short writeup: "what I'd do differently for a production migration" (shows judgment, not just execution)
-
-Want me to help you scaffold the actual Terraform module structure and Packer template next, or do you want to get the on-prem VMs running first?
+Want to start executing Part 1 (AWS instance launch) now, or do you want me to also write out the DB seed script and sample PHP app first so you have real content to migrate?
